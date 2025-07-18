@@ -1,6 +1,8 @@
 #![cfg_attr(not(feature = "dev"), windows_subsystem = "windows")]
 
 use bevy::input::common_conditions::input_just_pressed;
+use bevy::render::render_resource::{AsBindGroup, ShaderRef};
+use bevy::sprite::{AlphaMode2d, Material2d, Material2dPlugin};
 use bevy::{prelude::*, render::primitives::Aabb, window::WindowResolution};
 #[cfg(debug_assertions)]
 use bevy_inspector_egui::bevy_egui::EguiPlugin;
@@ -10,7 +12,7 @@ use rand::Rng;
 
 fn main() {
     let mut app = App::new();
-    app.add_plugins(
+    app.add_plugins((
         DefaultPlugins.set(WindowPlugin {
             primary_window: Window {
                 resolution: WindowResolution::new(320., 512.),
@@ -22,9 +24,18 @@ fn main() {
             .into(),
             ..default()
         }),
-    )
+        Material2dPlugin::<WaveMaterial>::default(),
+    ))
     .add_systems(Startup, setup)
-    .add_systems(Update, (update_doodle, update_tiles, update_score))
+    .add_systems(
+        Update,
+        (
+            update_doodle,
+            update_tiles,
+            update_score,
+            update_wave_material,
+        ),
+    )
     .add_systems(
         Update,
         trigger_restart.run_if(input_just_pressed(KeyCode::KeyR)),
@@ -123,6 +134,8 @@ fn restart_game(
     _: Trigger<RestartGame>,
     mut cmd: Commands,
     assets: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<WaveMaterial>>,
     mut score: ResMut<Score>,
     doodle: Query<Entity, With<Doodle>>,
     tiles: Query<Entity, With<Tile>>,
@@ -139,10 +152,11 @@ fn restart_game(
     cmd.spawn((
         Name::new("Doodle"),
         Doodle(0.),
-        Sprite {
-            image: assets.load("doodle.png"),
-            ..default()
-        },
+        Mesh2d(meshes.add(Rectangle::new(62., 60.))),
+        MeshMaterial2d(materials.add(WaveMaterial {
+            time: 0.,
+            texture: assets.load("doodle.png"),
+        })),
         Transform::from_xyz(0., -195., 0.),
     ));
 
@@ -173,29 +187,24 @@ fn restart_game(
 struct Doodle(f32); // Vertical speed
 
 fn update_doodle(
-    mut doodle: Query<
-        (Entity, &mut Transform, &mut Sprite, &mut Doodle, &Aabb),
-        Without<Tile>,
-    >,
+    doodle: Single<(Entity, &mut Transform, &mut Doodle, &Aabb), Without<Tile>>,
     tiles: Query<(&Transform, &Aabb), With<Tile>>,
     keyboard: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     mut cmd: Commands,
 ) {
-    let Ok((entity, mut transform, mut sprite, mut speed, aabb)) = doodle.single_mut() else {
-        return;
-    };
+    let (entity, mut transform, mut speed, aabb) = doodle.into_inner();
 
     // Horizontal movement
     let mut dir_x = 0.;
     const HORIZONTAL_VELOCITY: f32 = 500.;
     if keyboard.pressed(KeyCode::KeyA) {
         dir_x -= 1.;
-        sprite.flip_x = false;
+        transform.scale.x = 1.;
     }
     if keyboard.pressed(KeyCode::KeyD) {
         dir_x += 1.;
-        sprite.flip_x = true;
+        transform.scale.x = -1.;
     }
     transform.translation.x += dir_x * HORIZONTAL_VELOCITY * time.delta_secs();
 
@@ -233,7 +242,7 @@ fn update_doodle(
     }
     for (tile_transform, tile_aabb) in &tiles {
         let x_diff = transform.translation.x - tile_transform.translation.x;
-        let y_diff = transform.translation.y - tile_transform.translation.y;
+        let y_diff = transform.translation.y + 8. - tile_transform.translation.y;
         if y_diff > (aabb.half_extents.y + tile_aabb.half_extents.y) - 15.
             && y_diff < (aabb.half_extents.y + tile_aabb.half_extents.y)
             && x_diff.abs() < (aabb.half_extents.x / 2. + tile_aabb.half_extents.x)
@@ -267,15 +276,13 @@ const TILE_BOUNDARY: f32 = 130.;
 
 fn update_tiles(
     mut tiles: Query<(Entity, &mut Transform), With<Tile>>,
-    doodle: Query<(&Doodle, &Transform), Without<Tile>>,
+    doodle: Single<(&Doodle, &Transform), Without<Tile>>,
     time: Res<Time>,
     mut cmd: Commands,
     assets: Res<AssetServer>,
     mut next_tile: ResMut<NextTile>,
 ) {
-    let Ok((doodle_speed, doodle_transform)) = doodle.single() else {
-        return;
-    };
+    let (doodle_speed, doodle_transform) = doodle.into_inner();
     if doodle_transform.translation.y < -5. || doodle_speed.0 < 0. {
         return;
     }
@@ -316,18 +323,40 @@ struct Score(f32);
 struct ScoreText;
 
 fn update_score(
-    doodle: Query<(&Doodle, &Transform)>,
+    doodle: Single<(&Doodle, &Transform)>,
     mut score: ResMut<Score>,
-    mut score_text: Query<&mut Text, With<ScoreText>>,
+    mut score_text: Single<&mut Text, With<ScoreText>>,
 ) {
-    let Ok((doodle_speed, doodle_transform)) = doodle.single() else {
-        return;
-    };
+    let (doodle_speed, doodle_transform) = doodle.into_inner();
     if doodle_transform.translation.y < -5. || doodle_speed.0 < 0. {
         return;
     }
 
     score.0 += doodle_speed.0 / 200.;
-    let mut score_text = score_text.single_mut().unwrap();
     score_text.0 = format!("Score: {:.0}", score.0);
+}
+
+#[derive(Asset, TypePath, AsBindGroup, Clone)]
+struct WaveMaterial {
+    #[uniform(0)]
+    time: f32,
+    #[texture(1)]
+    #[sampler(2)]
+    texture: Handle<Image>,
+}
+
+impl Material2d for WaveMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "wave_material.wgsl".into()
+    }
+
+    fn alpha_mode(&self) -> AlphaMode2d {
+        AlphaMode2d::Blend
+    }
+}
+
+fn update_wave_material(mut materials: ResMut<Assets<WaveMaterial>>, time: Res<Time>) {
+    for material in materials.iter_mut() {
+        material.1.time += time.delta_secs();
+    }
 }
